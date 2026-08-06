@@ -1,35 +1,43 @@
 #!/usr/bin/env python3
 """One-shot async download + convert pipeline for SPICE PDB data.
 
-Asynchronous download (aiohttp) of full-entry mmCIF files, parse the
-fragments SPICE needs with gemmi, and write them as Parquet via polars
-in sliding chunks (chunk-full -> write -> clear, so memory stays bounded).
-Raw files are deleted after conversion. Resumable, live progress bar.
-
-WHY full entry (not biological assembly): the RCSB `{id}-assembly1.cif.gz`
-files do NOT carry the environment metadata (`_exptl_crystal_grow.pH/.temp`)
-that SPICE needs; the full entry does.
+Supports separate download-only and convert-only modes with resumable progress.
 
 Usage (Python 3.10+, run on Colab / server):
     pip install aiohttp aiofiles gemmi polars pyarrow tqdm
-    python download_pdb.py pdb_ids.txt --out data --jobs 64 [--limit 100]
+
+    # Download only
+    python download_pdb.py pdb_ids.txt --out data --jobs 64 --download-only
+
+    # Convert only (all raw files)
+    python download_pdb.py --out data --convert-only
+
+    # Convert only for specific IDs
+    python download_pdb.py pdb_ids.txt --out data --convert-only
+
+    # Full pipeline (download then convert)
+    python download_pdb.py pdb_ids.txt --out data --jobs 64 --chunk 5000
 
 Outputs:
-    data/raw/...                 (transient, deleted after conversion)
+    data/raw/...                 (transient, deleted after conversion unless --keep-raw)
     data/parquet/entries_*.parquet   (one row per structure)
     data/parquet/atoms_*.parquet     (one row per atom, long format)
     data/parquet/.converted      (resume marker: already-processed IDs)
+    data/parquet/state.pkl       (pickle checkpoint: converted set)
     data/parquet/_failures.txt   (download/parse failures)
 
-Resume: already-processed IDs (in `.converted`) and files already present
-in `data/raw` are skipped, so an interrupted run can be restarted safely.
+Resume:
+    - Download: raw files already present are skipped.
+    - Convert: IDs in .converted are skipped; interrupted conversion restarts safely.
 """
 
 import argparse
 import asyncio
 import gzip
 import os
+import pickle
 import re
+import signal
 import sys
 import time
 
@@ -43,18 +51,17 @@ try:
 except ImportError:
     tqdm = None
 
-BASE_URL = "https://files.wwpdb.org/download"  # 官方推荐域名
+BASE_URL = "https://files.wwpdb.org/download"
 SUFFIX = ".cif.gz"
 RETRIES = 3
 MIN_VALID_SIZE = 100
 TIMEOUT = aiohttp.ClientTimeout(total=90)
 
-# Environment range validation (applied during local parse — PDB may hold junk).
 PH_MIN, PH_MAX = 0.0, 14.0
 TEMP_MIN, TEMP_MAX = 150.0, 400.0
 
 # ---------------------------------------------------------------------------
-# 1-letter amino-acid map (used when _entity_poly sequence is unavailable)
+# 1-letter amino-acid map
 # ---------------------------------------------------------------------------
 ONELETTER = {
     "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
@@ -67,7 +74,7 @@ ONELETTER = {
 }
 
 # ---------------------------------------------------------------------------
-# Ionic-strength heuristic over free-text `pdbx_details` (tunable)
+# Ionic-strength heuristic
 # ---------------------------------------------------------------------------
 HAS_SALT_RE = re.compile(
     r"(NaCl|KCl|LiCl|MgCl2|CaCl2|NH4Cl|ammonium sulfate|ammonium sulphate|"
@@ -158,7 +165,6 @@ def parse_block(path: str):
         or _as_float(block, "_em_3d_reconstruction.resolution")
         or _as_float(block, "_reflns.d_resolution_high")
     )
-    # Validate environment values are physically plausible (PDB may hold junk).
     ph_ok = ph is not None and PH_MIN <= ph <= PH_MAX
     temp_ok = temp is not None and TEMP_MIN <= temp <= TEMP_MAX
 
@@ -238,7 +244,7 @@ def parse_block(path: str):
 
 
 # ---------------------------------------------------------------------------
-# Parquet schemas (polars)
+# Parquet schemas
 # ---------------------------------------------------------------------------
 ENTRY_SCHEMA = {
     "pdb_id": pl.String, "method": pl.String, "resolution": pl.Float64,
@@ -256,29 +262,125 @@ ATOM_SCHEMA = {
 }
 
 
-def write_sliding_chunk(entries, atoms, ids, parq_dir, shard_no, raw_dir, conv_marker):
-    """Write one chunk to Parquet (polars), then delete the raw files."""
+def _atomic_write_parquet(df, path):
+    tmp = path + ".tmp"
+    df.write_parquet(tmp)
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint for converted IDs
+# ---------------------------------------------------------------------------
+STATE_FILE = "state.pkl"
+SAVE_EVERY = 200
+
+
+class Checkpoint:
+    def __init__(self, path):
+        self.path = path
+        self.converted = set()
+
+    @classmethod
+    def open(cls, parq_dir):
+        cp = cls(os.path.join(parq_dir, STATE_FILE))
+        cp.load()
+        return cp
+
+    def load(self):
+        try:
+            with open(self.path, "rb") as f:
+                d = pickle.load(f)
+            self.converted = {str(x).lower() for x in d.get("converted", ())}
+        except (OSError, EOFError, ValueError, pickle.UnpicklingError):
+            pass
+
+    def save(self):
+        tmp = self.path + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump({"converted": sorted(self.converted)}, f,
+                        protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, self.path)
+
+
+def write_sliding_chunk(entries, atoms, ids, parq_dir, shard_no, keep_raw, raw_dir, conv_marker, state):
+    """Write one chunk to Parquet atomically, update .converted and state."""
     shard_no += 1
-    pl.DataFrame(entries, schema=ENTRY_SCHEMA).write_parquet(
-        os.path.join(parq_dir, f"entries_shard_{shard_no:04d}.parquet")
-    )
-    pl.DataFrame(atoms, schema=ATOM_SCHEMA).write_parquet(
-        os.path.join(parq_dir, f"atoms_shard_{shard_no:04d}.parquet")
-    )
+    atoms_path = os.path.join(parq_dir, f"atoms_shard_{shard_no:04d}.parquet")
+    entries_path = os.path.join(parq_dir, f"entries_shard_{shard_no:04d}.parquet")
+    _atomic_write_parquet(pl.DataFrame(atoms, schema=ATOM_SCHEMA), atoms_path)
+    _atomic_write_parquet(pl.DataFrame(entries, schema=ENTRY_SCHEMA), entries_path)
+
+    # Update converted marker
     with open(conv_marker, "a", encoding="utf-8") as f:
         f.write("\n".join(ids) + "\n")
-    for ident in ids:
-        src = os.path.join(raw_dir, ident.lower() + SUFFIX)
-        if os.path.exists(src):
-            os.remove(src)
+    state.converted.update(i.lower() for i in ids)
+    state.save()
+
+    # Delete raw files unless keep_raw
+    if not keep_raw:
+        for ident in ids:
+            src = os.path.join(raw_dir, ident.lower() + SUFFIX)
+            if os.path.exists(src):
+                os.remove(src)
     return shard_no
 
 
 # ---------------------------------------------------------------------------
-# Async download + parse
+# Download-only
 # ---------------------------------------------------------------------------
-async def fetch_one(session, ident, raw_dir):
-    """Download one file (skip if present & valid). Returns (status, path)."""
+async def download_ids(ids, raw_dir, jobs, stop_event=None):
+    """Download only, skip if raw file already exists."""
+    sem = asyncio.Semaphore(jobs)
+    connector = aiohttp.TCPConnector(limit=jobs * 2, limit_per_host=jobs)
+    fail_log = os.path.join(raw_dir, "_download_failures.txt")
+    ok = skipped = failed = 0
+
+    pbar = tqdm(total=len(ids), unit="entry", disable=tqdm is None)
+    t0 = time.time()
+
+    async with aiohttp.ClientSession(connector=connector, timeout=TIMEOUT) as session:
+        # Use a queue to process IDs with semaphore
+        tasks = []
+        for ident in ids:
+            if stop_event and stop_event.is_set():
+                break
+            # Wait for semaphore before creating task
+            async with sem:
+                task = asyncio.create_task(download_one(session, ident, raw_dir))
+                tasks.append(task)
+
+        for task in asyncio.as_completed(tasks):
+            if stop_event and stop_event.is_set():
+                break
+            try:
+                status, dest = await task
+            except Exception as e:
+                status = f"exception: {e}"
+                failed += 1
+                pbar.update(1)
+                continue
+
+            key = status.split(":")[0]
+            if key in ("ok", "exists"):
+                if key == "exists":
+                    skipped += 1
+                else:
+                    ok += 1
+            else:
+                failed += 1
+                # Log failure
+                ident = os.path.basename(dest).replace(SUFFIX, "")
+                with open(fail_log, "a", encoding="utf-8") as f:
+                    f.write(f"{ident}\t{status}\n")
+            pbar.update(1)
+
+    elapsed = time.time() - t0
+    if pbar:
+        pbar.close()
+    return ok, skipped, failed, elapsed
+
+
+async def download_one(session, ident, raw_dir):
     dest = os.path.join(raw_dir, ident.lower() + SUFFIX)
     if os.path.exists(dest) and os.path.getsize(dest) > MIN_VALID_SIZE:
         return "exists", dest
@@ -302,129 +404,226 @@ async def fetch_one(session, ident, raw_dir):
                 return "ok", dest
         except Exception as e:
             if attempt < RETRIES - 1:
-                await asyncio.sleep(2 ** attempt)  # 指数退避：1, 2, 4 秒
+                await asyncio.sleep(2 ** attempt)
             else:
                 return f"{type(e).__name__}: {e}", dest
     return "unknown", dest
 
 
-async def process_one(session, sem, ident, raw_dir):
-    """Download then parse (gemmi offloaded to a thread). Returns (ident, entry, atoms, status)."""
-    async with sem:
-        status, path = await fetch_one(session, ident, raw_dir)
-    if status not in ("ok", "exists"):
-        return ident, None, None, f"fail:{status}"
-    entry, atoms = await asyncio.to_thread(parse_block, path)
-    if entry is None:
-        return ident, None, None, "parse_fail"
-    return ident, entry, atoms, status
+# ---------------------------------------------------------------------------
+# Convert-only
+# ---------------------------------------------------------------------------
+async def convert_all(raw_dir, parq_dir, chunk, ids=None, keep_raw=False,
+                      flush_every=0.0, stop_event=None, state=None):
+    """Convert all raw files (or subset) to Parquet, skip already converted."""
+    if state is None:
+        state = Checkpoint.open(parq_dir)
 
-
-async def run(ids, raw_dir, parq_dir, chunk, jobs):
-    sem = asyncio.Semaphore(jobs)
-    connector = aiohttp.TCPConnector(limit=jobs * 2, limit_per_host=jobs)
-    fail_log = os.path.join(parq_dir, "_failures.txt")
+    # Load converted from .converted file (for backward compatibility)
     conv_marker = os.path.join(parq_dir, ".converted")
+    if os.path.exists(conv_marker):
+        with open(conv_marker, encoding="utf-8") as f:
+            state.converted |= {ln.strip().lower() for ln in f if ln.strip()}
 
-    existing = [f for f in os.listdir(parq_dir) if f.startswith("entries_shard_")]
-    shard_no = len(existing)
+    # Gather raw files
+    if ids is None:
+        # Scan all .cif.gz files
+        raw_files = [f for f in os.listdir(raw_dir) if f.endswith(SUFFIX)]
+        ids = [f[:-len(SUFFIX)].lower() for f in raw_files]
+    else:
+        ids = [i.lower() for i in ids]
+        # Only include files that exist
+        existing = []
+        for i in ids:
+            path = os.path.join(raw_dir, i + SUFFIX)
+            if os.path.exists(path) and os.path.getsize(path) > MIN_VALID_SIZE:
+                existing.append(i)
+        ids = existing
 
-    pbar = tqdm(total=len(ids), unit="entry", disable=tqdm is None)
-    ok = skipped = failed = parse_failed = 0
+    # Remove already converted
+    pending = [i for i in ids if i not in state.converted]
+    if not pending:
+        print("No pending files to convert.")
+        return 0, 0, 0, 0
+
+    # Determine starting shard number
+    existing_shards = [f for f in os.listdir(parq_dir) if f.startswith("entries_shard_")]
+    shard_no = len(existing_shards)
+
+    pbar = tqdm(total=len(pending), unit="entry", disable=tqdm is None)
+    ok = parse_failed = failed = 0
     buf_entries, buf_atoms, buf_ids = [], [], []
-    t0 = time.time()
+    last_flush = time.time()
+    t0 = last_flush
 
-    async with aiohttp.ClientSession(connector=connector, timeout=TIMEOUT) as session:
-        tasks = [asyncio.create_task(process_one(session, sem, i, raw_dir)) for i in ids]
-        for coro in asyncio.as_completed(tasks):
-            ident, entry, atoms, status = await coro
-            key = status.split(":")[0]
-            if entry is not None:
-                buf_entries.append(entry)
-                buf_atoms.extend(atoms)
-                buf_ids.append(ident)
-                if key == "exists":
-                    skipped += 1
-                else:
-                    ok += 1
-                if len(buf_entries) >= chunk:
-                    shard_no = write_sliding_chunk(
-                        buf_entries, buf_atoms, buf_ids, parq_dir, shard_no,
-                        raw_dir, conv_marker,
-                    )
-                    buf_entries, buf_atoms, buf_ids = [], [], []
-            elif key == "parse_fail":
-                parse_failed += 1
-                fail_dir = os.path.join(raw_dir, "_parse_failed")
-                os.makedirs(fail_dir, exist_ok=True)
-                src = os.path.join(raw_dir, ident.lower() + SUFFIX)
-                if os.path.exists(src):
-                    os.replace(src, os.path.join(fail_dir, ident.lower() + SUFFIX))
-            else:
-                failed += 1
-                with open(fail_log, "a", encoding="utf-8") as f:
-                    f.write(f"{ident}\t{status}\n")
-            if pbar is not None:
-                elapsed = time.time() - t0
-                pbar.set_postfix(
-                    ok=ok, skip=skipped, fail=failed,
-                    rate=f"{(ok+skipped+failed)/elapsed if elapsed else 0:.1f}/s",
-                    refresh=False,
-                )
-                pbar.update(1)
+    def flush():
+        nonlocal shard_no, last_flush, ok
+        if buf_entries:
+            shard_no = write_sliding_chunk(
+                buf_entries, buf_atoms, buf_ids, parq_dir, shard_no,
+                keep_raw, raw_dir, conv_marker, state
+            )
+            ok += len(buf_ids)
+            buf_entries.clear()
+            buf_atoms.clear()
+            buf_ids.clear()
+            state.save()
+        last_flush = time.time()
 
+    for ident in pending:
+        if stop_event and stop_event.is_set():
+            break
+        path = os.path.join(raw_dir, ident + SUFFIX)
+        entry, atoms = await asyncio.to_thread(parse_block, path)
+        if entry is not None:
+            buf_entries.append(entry)
+            buf_atoms.extend(atoms)
+            buf_ids.append(ident)
+            # Flush if full or timed out
+            if len(buf_entries) >= chunk:
+                flush()
+            elif flush_every > 0 and (time.time() - last_flush) >= flush_every:
+                flush()
+        else:
+            # Parse failed: move to failure dir
+            parse_failed += 1
+            fail_dir = os.path.join(raw_dir, "_parse_failed")
+            os.makedirs(fail_dir, exist_ok=True)
+            src = path
+            if os.path.exists(src):
+                os.replace(src, os.path.join(fail_dir, ident + SUFFIX))
+        pbar.update(1)
+
+    # Final flush
     if buf_entries:
-        shard_no = write_sliding_chunk(
-            buf_entries, buf_atoms, buf_ids, parq_dir, shard_no, raw_dir, conv_marker,
-        )
+        flush()
 
-    if pbar is not None:
+    elapsed = time.time() - t0
+    if pbar:
         pbar.close()
-    return ok, skipped, failed, parse_failed, time.time() - t0
+    return ok, parse_failed, failed, elapsed
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("idlist")
-    ap.add_argument("--out", default="data")
-    ap.add_argument("--jobs", type=int, default=32, help="concurrent downloads")
-    ap.add_argument("--chunk", type=int, default=5000, help="structures per parquet shard")
-    ap.add_argument("--limit", type=int, default=0, help="only first N IDs")
+    ap.add_argument('idlist', nargs='?', help='file with PDB IDs (required for download/all mode)')
+    ap.add_argument('--out', default='data', help='output directory (default: data)')
+    ap.add_argument('--jobs', type=int, default=32, help='concurrent downloads')
+    ap.add_argument('--chunk', type=int, default=5000, help='structures per parquet shard')
+    ap.add_argument('--limit', type=int, default=0, help='only first N IDs (download only)')
+    ap.add_argument('--flush-every', type=float, default=0.0,
+                    help='seconds between forced flushes during conversion')
+    ap.add_argument('--download-only', action='store_true', help='only download, do not convert')
+    ap.add_argument('--convert-only', action='store_true', help='only convert, do not download')
+    ap.add_argument('--keep-raw', action='store_true', help='keep raw files after conversion')
     args = ap.parse_args()
 
-    raw_dir = os.path.join(args.out, "raw")
-    parq_dir = os.path.join(args.out, "parquet")
+    # Mutual exclusivity
+    if args.download_only and args.convert_only:
+        print("Error: --download-only and --convert-only are mutually exclusive.", file=sys.stderr)
+        return 1
+
+    raw_dir = os.path.join(args.out, 'raw')
+    parq_dir = os.path.join(args.out, 'parquet')
     os.makedirs(raw_dir, exist_ok=True)
     os.makedirs(parq_dir, exist_ok=True)
 
-    with open(args.idlist, encoding="utf-8") as f:
-        ids = [ln.strip() for ln in f if ln.strip()]
-    if args.limit:
-        ids = ids[: args.limit]
+    # Load IDs if provided
+    ids = None
+    if args.idlist:
+        with open(args.idlist, encoding='utf-8') as f:
+            ids = [ln.strip() for ln in f if ln.strip()]
+        if args.limit:
+            ids = ids[:args.limit]
 
-    # resume: skip IDs already converted
-    conv_marker = os.path.join(parq_dir, ".converted")
-    converted = set()
-    if os.path.exists(conv_marker):
-        with open(conv_marker, encoding="utf-8") as f:
-            converted = {ln.strip().lower() for ln in f if ln.strip()}
-    pending = [i for i in ids if i.lower() not in converted]
+    # Download-only
+    if args.download_only:
+        if not ids:
+            print("Error: --download-only requires an ID list file.", file=sys.stderr)
+            return 1
+        print(f"Download mode: {len(ids)} IDs, jobs={args.jobs}")
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        stop_event = asyncio.Event()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, stop_event.set)
+            except (NotImplementedError, RuntimeError):
+                pass
+        try:
+            ok, skipped, failed, elapsed = loop.run_until_complete(
+                download_ids(ids, raw_dir, args.jobs, stop_event)
+            )
+        finally:
+            loop.close()
+        print(f"Download done: ok={ok}, skipped={skipped}, failed={failed} in {elapsed:.0f}s")
+        return 0 if failed == 0 else 1
 
-    print(f"total={len(ids)} to_process={len(pending)} "
-          f"(already converted={len(ids)-len(pending)}) jobs={args.jobs} chunk={args.chunk}")
-    if not pending:
-        print("nothing to do")
-        return 0
+    # Convert-only
+    if args.convert_only:
+        print(f"Convert mode: scanning {raw_dir}")
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        stop_event = asyncio.Event()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, stop_event.set)
+            except (NotImplementedError, RuntimeError):
+                pass
+        try:
+            ok, parse_failed, failed, elapsed = loop.run_until_complete(
+                convert_all(raw_dir, parq_dir, args.chunk, ids=ids,
+                            keep_raw=args.keep_raw, flush_every=args.flush_every,
+                            stop_event=stop_event)
+            )
+        finally:
+            loop.close()
+        print(f"Convert done: converted={ok}, parse_failed={parse_failed}, failed={failed} in {elapsed:.0f}s")
+        return 0 if (parse_failed + failed) == 0 else 1
 
-    ok, skipped, failed, parse_failed, elapsed = asyncio.run(
-        run(pending, raw_dir, parq_dir, args.chunk, args.jobs)
-    )
-    print(f"\ndone: ok={ok} skipped={skipped} failed={failed} parse_failed={parse_failed} "
-          f"in {elapsed:.0f}s ({(ok+skipped+failed)/elapsed if elapsed else 0:.1f}/s)")
-    if failed:
-        print(f"failures logged in {os.path.join(parq_dir, '_failures.txt')}", file=sys.stderr)
-    return 0 if failed == 0 else 1
+    # Full pipeline: download then convert
+    if not ids:
+        print("Error: full pipeline requires an ID list file.", file=sys.stderr)
+        return 1
+
+    print(f"Full pipeline: {len(ids)} IDs, jobs={args.jobs}, chunk={args.chunk}")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    stop_event = asyncio.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except (NotImplementedError, RuntimeError):
+            pass
+
+    try:
+        # Download phase
+        print("\n=== Download phase ===")
+        ok_dl, skipped_dl, failed_dl, elapsed_dl = loop.run_until_complete(
+            download_ids(ids, raw_dir, args.jobs, stop_event)
+        )
+        print(f"Download done: ok={ok_dl}, skipped={skipped_dl}, failed={failed_dl} in {elapsed_dl:.0f}s")
+        if failed_dl > 0:
+            print(f"Warning: {failed_dl} download failures. Conversion will skip missing files.")
+
+        # Convert phase
+        print("\n=== Convert phase ===")
+        ok_cv, parse_failed, failed_cv, elapsed_cv = loop.run_until_complete(
+            convert_all(raw_dir, parq_dir, args.chunk, ids=ids,
+                        keep_raw=args.keep_raw, flush_every=args.flush_every,
+                        stop_event=stop_event)
+        )
+        print(f"Convert done: converted={ok_cv}, parse_failed={parse_failed}, failed={failed_cv} in {elapsed_cv:.0f}s")
+
+    finally:
+        loop.close()
+
+    total_fail = failed_dl + parse_failed + failed_cv
+    return 0 if total_fail == 0 else 1
 
 
 if __name__ == "__main__":
